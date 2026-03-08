@@ -1276,6 +1276,15 @@
             console.warn('Low memory device detected:', navigator.deviceMemory, 'GB');
           }
 
+          // iOS: speechSynthesis handles live playback — no model loading or audio download needed
+          if (device.isIOS) {
+            setLibrary(prev => prev.map(s => s.id === story.id
+              ? { ...s, status: 'cached', progress: 100, progressText: null } : s));
+            processingRef.current = null;
+            playCue('download_done');
+            return;
+          }
+
           // Ensure model is loaded before we start downloading
           if (!ttsRef.current) {
             // Show the loading screen so the user can see model download progress
@@ -1297,14 +1306,6 @@
 
           // Mobile-aware pacing: yield between items to keep UI responsive
           const isMobile = device.isMobile;
-          // iOS: mark as cached instantly — audio plays live via speechSynthesis
-          if (device.isIOS) {
-            setLibrary(prev => prev.map(s => s.id === story.id
-              ? { ...s, status: 'cached', progress: 100, progressText: null } : s));
-            processingRef.current = null;
-            playCue('download_done');
-            return;
-          }
           // Single delay per item — enough to prevent ANR without freezing progress
           const ITEM_DELAY = isMobile ? 150 : 30;
           // Extra pause every N items to let GC run
@@ -1793,46 +1794,10 @@
           } catch (e) { /* Cache miss, generate fresh */ }
         }
 
-        // Ensure worker + model are loaded
+        // Ensure model is loaded
         if (!ttsRef.current) {
           const success = await loadPocketTTSModel();
           if (!success) return null;
-        }
-
-        // iOS: use speechSynthesis — Kyutai WASM exceeds iOS Safari memory limits
-        if (deviceInfoRef.current.isIOS) {
-          return new Promise((resolve) => {
-            // Ensure voices are loaded (may need a tiny delay on first call)
-            const speak = () => {
-              const utterance = new SpeechSynthesisUtterance(cleanText);
-              const voices = window.speechSynthesis.getVoices();
-              // Prefer high-quality English voices (Siri voices on iOS are actually good)
-              const preferred = voices.find(v => v.name.includes('Samantha') || v.name.includes('Daniel') ||
-                v.name.includes('Karen') || v.name.includes('Moira'));
-              const enVoice = preferred ||
-                voices.find(v => v.lang === 'en-US' && v.localService) ||
-                voices.find(v => v.lang.startsWith('en') && v.localService) ||
-                voices.find(v => v.lang.startsWith('en')) || null;
-              if (enVoice) utterance.voice = enVoice;
-              utterance.rate = 0.88;
-              utterance.pitch = 1.0;
-
-              // For caching: render to WAV blob via AudioContext if supported
-              // (iOS doesn't support this so we cache a sentinel flag instead)
-              utterance.onend = () => resolve(null);
-              utterance.onerror = () => resolve(null);
-              window.speechSynthesis.speak(utterance);
-              // Return null since iOS TTS plays directly — no blob URL needed
-              resolve(null);
-            };
-            if (window.speechSynthesis.getVoices().length > 0) {
-              speak();
-            } else {
-              window.speechSynthesis.onvoiceschanged = () => { window.speechSynthesis.onvoiceschanged = null; speak(); };
-              // Fallback if onvoiceschanged never fires
-              setTimeout(speak, 300);
-            }
-          });
         }
 
         try {
@@ -3604,26 +3569,23 @@
       const ua = navigator.userAgent || '';
       const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
-      // iOS Safari: only unregister old SW registrations — do NOT wipe the CDN/
-      // font/script caches since that forces re-download of Babel, React etc. on
-      // every page load, causing timeout crashes on slow connections.
       if (isIOS) {
-        window.addEventListener('load', async () => {
-          try {
-            const regs = await navigator.serviceWorker.getRegistrations();
-            await Promise.all(regs.map(r => r.unregister()));
-            // Only delete the StoryTap app cache, not browser-managed CDN caches
-            if (window.caches && caches.keys) {
-              const names = await caches.keys();
-              await Promise.all(
-                names.filter(n => n.startsWith('storytap')).map(name => caches.delete(name))
-              );
+        // iOS: no SW. Run a ONE-TIME cleanup of any old SW from previous app versions.
+        // Uses localStorage flag so this only runs once, not on every page load.
+        if (!localStorage.getItem('ios_sw_unregistered_v1')) {
+          window.addEventListener('load', async () => {
+            try {
+              const regs = await navigator.serviceWorker.getRegistrations();
+              if (regs.length > 0) {
+                await Promise.all(regs.map(r => r.unregister()));
+                console.log('iOS: old SW registrations cleared');
+              }
+              localStorage.setItem('ios_sw_unregistered_v1', '1');
+            } catch (e) {
+              console.warn('iOS SW cleanup failed:', e);
             }
-            console.log('iOS mode: old SW unregistered, storytap caches cleared');
-          } catch (e) {
-            console.warn('iOS SW cleanup failed:', e);
-          }
-        });
+          });
+        }
       } else {
         window.addEventListener('load', () => {
           navigator.serviceWorker.register('sw.js')
