@@ -1,4 +1,4 @@
-const CACHE_NAME = 'storytap-v1.0.4';
+const CACHE_NAME = 'storytap-v1.0.5';
 const ASSETS_TO_CACHE = [
   './',
   './index.html',
@@ -106,11 +106,18 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // CDN resources (esm.sh, unpkg, huggingface, laurentmazare.github.io, etc): Cache first with revalidation
+  // Model/WASM files (HuggingFace, laurentmazare.github.io): pass through to browser HTTP cache.
+  // These are large files (240MB+) — caching them in SW storage causes the entire cache to be
+  // wiped on every SW version bump, forcing a full re-download. The browser's own HTTP cache
+  // (which respects Cache-Control headers) handles these much better.
+  if (url.hostname.includes('huggingface.co') ||
+    url.hostname.includes('laurentmazare.github.io')) {
+    return; // Let browser handle natively
+  }
+
+  // CDN resources (esm.sh, unpkg, etc): Cache first with revalidation
   if (url.hostname.includes('esm.sh') ||
     url.hostname.includes('unpkg.com') ||
-    url.hostname.includes('huggingface.co') ||
-    url.hostname.includes('laurentmazare.github.io') ||
     url.hostname.includes('cdn.')) {
     e.respondWith(
       caches.open(CACHE_NAME).then(async (cache) => {

@@ -2140,7 +2140,11 @@
         if (isTransitioning) { playCue('busy'); return; }
 
         if (isPlaying) {
-          if (!allowSkip) { playCue('busy'); return; }
+          // On iOS, always allow tapping through — speechSynthesis has no
+          // buffering concern and can stall silently (onend never fires).
+          // Forcing cancel+advance keeps the app from getting stuck.
+          const isIOS = deviceInfoRef.current?.isIOS;
+          if (!allowSkip && !isIOS) { playCue('busy'); return; }
           // Skip mode: stop current audio and continue to advance
           if (audioRef.current) {
             try { audioRef.current.pause(); audioRef.current.currentTime = 0; } catch (e) { }
