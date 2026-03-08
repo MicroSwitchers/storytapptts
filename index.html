@@ -1297,6 +1297,14 @@
 
           // Mobile-aware pacing: yield between items to keep UI responsive
           const isMobile = device.isMobile;
+          // iOS: mark as cached instantly — audio plays live via speechSynthesis
+          if (device.isIOS) {
+            setLibrary(prev => prev.map(s => s.id === story.id
+              ? { ...s, status: 'cached', progress: 100, progressText: null } : s));
+            processingRef.current = null;
+            playCue('download_done');
+            return;
+          }
           // Single delay per item — enough to prevent ANR without freezing progress
           const ITEM_DELAY = isMobile ? 150 : 30;
           // Extra pause every N items to let GC run
@@ -1340,7 +1348,7 @@
               consecutiveErrors++;
 
               // Pause after error to let browser recover
-              await new Promise(r => setTimeout(r, isIOS ? 1000 : 500));
+              await new Promise(r => setTimeout(r, device.isIOS ? 1000 : 500));
 
               // Bail out if device is struggling (too many failures in a row)
               if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
@@ -1606,8 +1614,6 @@
       const deviceInfoRef = useRef(getDeviceInfo());
       const device = deviceInfoRef.current; // Shortcut for inline use in JSX
       const initPromiseRef = useRef(null);
-      const workerRef = useRef(null);         // Web Worker for iOS (keeps WASM off main thread)
-      const workerCallbacksRef = useRef({}); // Pending {resolve,reject} keyed by message id
       const libraryBlockRef = useRef(0); // Timestamp to block library clicks after exit
 
       const { play: playCue } = useAudioCues(soundCuesEnabled, vibrationEnabled);
@@ -1628,45 +1634,10 @@
       // =============================================
       // POCKET TTS ENGINE (WASM)
       // Model: kyutai/pocket-tts (MIT) — 100M params, 240MB one-time download
-      // iOS: runs in a Web Worker (avoids blocking main thread → prevents Safari kill)
+      // iOS: uses speechSynthesis — the 240MB WASM model exceeds iOS Safari
+      //      memory limits regardless of thread, causing tab kills.
       // Android/Desktop: runs on main thread via dynamic import()
       // =============================================
-
-      // Create (or reuse) the Web Worker for iOS.
-      // Routes worker messages to React state and to pending Promise callbacks.
-      const initWorker = useCallback(() => {
-        if (workerRef.current) return workerRef.current;
-        const worker = new Worker('pocket-tts-worker.js', { type: 'module' });
-        worker.onmessage = (e) => {
-          const { type, id, wavData, message, pct, detail } = e.data;
-          if (type === 'progress') {
-            if (typeof pct === 'number' && pct >= 0) setModelProgress(prev => Math.max(prev, Math.min(pct, 99)));
-            if (detail) setModelStatus(detail);
-          } else if (type === 'status') {
-            if (message) setModelStatus(message);
-          } else if (type === 'loaded') {
-            const cb = workerCallbacksRef.current['__load__'];
-            if (cb) { delete workerCallbacksRef.current['__load__']; cb.resolve(true); }
-          } else if (type === 'audio_complete') {
-            const cb = workerCallbacksRef.current[id];
-            if (cb) { delete workerCallbacksRef.current[id]; cb.resolve(wavData); }
-          } else if (type === 'error') {
-            const key = id || '__load__';
-            const cb = workerCallbacksRef.current[key];
-            if (cb) { delete workerCallbacksRef.current[key]; cb.reject(new Error(message || 'Worker error')); }
-          }
-        };
-        worker.onerror = (err) => {
-          console.error('TTS Worker crashed:', err);
-          Object.keys(workerCallbacksRef.current).forEach(k => {
-            workerCallbacksRef.current[k]?.reject?.(new Error('Worker crashed'));
-            delete workerCallbacksRef.current[k];
-          });
-          workerRef.current = null; // Allow re-init on next attempt
-        };
-        workerRef.current = worker;
-        return worker;
-      }, []);
 
       const loadPocketTTSModel = useCallback(async () => {
         if (ttsRef.current) return true;
@@ -1677,17 +1648,12 @@
           setModelProgress(0);
           setModelStatus('Loading speech engine...');
           try {
-            // iOS: load via Web Worker — keeps WASM inference off the main thread
+            // iOS: the 240MB Kyutai WASM model exceeds iOS Safari memory limits.
+            // Even in a Worker the OS kills the process. Use speechSynthesis instead.
             if (deviceInfoRef.current.isIOS) {
-              const worker = initWorker();
-              await new Promise((resolve, reject) => {
-                workerCallbacksRef.current['__load__'] = { resolve, reject };
-                worker.postMessage({ type: 'load', voice });
-              });
-              ttsRef.current = true;
+              ttsRef.current = 'ios-tts';
               setModelProgress(100);
               setModelStatus('Ready');
-              console.log('Pocket TTS (Worker) loaded on iOS');
               return true;
             }
 
@@ -1833,21 +1799,40 @@
           if (!success) return null;
         }
 
-        // iOS: generate via Worker (WASM runs off the main thread)
-        if (deviceInfoRef.current.isIOS && workerRef.current) {
-          const genId = `gen_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-          try {
-            const wavBuffer = await new Promise((resolve, reject) => {
-              workerCallbacksRef.current[genId] = { resolve, reject };
-              workerRef.current.postMessage({ type: 'generate', text: cleanText, voice: useVoice, id: genId });
-            });
-            const wavBlob = new Blob([wavBuffer], { type: 'audio/wav' });
-            await setCachedAudio(cacheKey, wavBlob).catch(() => {});
-            return URL.createObjectURL(wavBlob);
-          } catch (workerErr) {
-            console.error('Worker generation error:', workerErr);
-            return null;
-          }
+        // iOS: use speechSynthesis — Kyutai WASM exceeds iOS Safari memory limits
+        if (deviceInfoRef.current.isIOS) {
+          return new Promise((resolve) => {
+            // Ensure voices are loaded (may need a tiny delay on first call)
+            const speak = () => {
+              const utterance = new SpeechSynthesisUtterance(cleanText);
+              const voices = window.speechSynthesis.getVoices();
+              // Prefer high-quality English voices (Siri voices on iOS are actually good)
+              const preferred = voices.find(v => v.name.includes('Samantha') || v.name.includes('Daniel') ||
+                v.name.includes('Karen') || v.name.includes('Moira'));
+              const enVoice = preferred ||
+                voices.find(v => v.lang === 'en-US' && v.localService) ||
+                voices.find(v => v.lang.startsWith('en') && v.localService) ||
+                voices.find(v => v.lang.startsWith('en')) || null;
+              if (enVoice) utterance.voice = enVoice;
+              utterance.rate = 0.88;
+              utterance.pitch = 1.0;
+
+              // For caching: render to WAV blob via AudioContext if supported
+              // (iOS doesn't support this so we cache a sentinel flag instead)
+              utterance.onend = () => resolve(null);
+              utterance.onerror = () => resolve(null);
+              window.speechSynthesis.speak(utterance);
+              // Return null since iOS TTS plays directly — no blob URL needed
+              resolve(null);
+            };
+            if (window.speechSynthesis.getVoices().length > 0) {
+              speak();
+            } else {
+              window.speechSynthesis.onvoiceschanged = () => { window.speechSynthesis.onvoiceschanged = null; speak(); };
+              // Fallback if onvoiceschanged never fires
+              setTimeout(speak, 300);
+            }
+          });
         }
 
         try {
@@ -1967,6 +1952,28 @@
         if (!url) {
           console.warn('No cached audio found for:', text.substring(0, 30));
         }
+
+        // iOS: play live via speechSynthesis (no WAV cache on iOS)
+        if (deviceInfoRef.current?.isIOS && window.speechSynthesis) {
+          window.speechSynthesis.cancel();
+          const utterance = new SpeechSynthesisUtterance(text);
+          const voices = window.speechSynthesis.getVoices();
+          const preferred = voices.find(v => v.name.includes('Samantha') || v.name.includes('Daniel') ||
+            v.name.includes('Karen') || v.name.includes('Moira'));
+          const enVoice = preferred ||
+            voices.find(v => v.lang === 'en-US' && v.localService) ||
+            voices.find(v => v.lang.startsWith('en') && v.localService) ||
+            voices.find(v => v.lang.startsWith('en')) || null;
+          if (enVoice) utterance.voice = enVoice;
+          utterance.rate = 0.88;
+          utterance.pitch = 1.0;
+          utterance.onend = () => { setIsPlaying(false); playCue('ready'); };
+          utterance.onerror = () => { setIsPlaying(false); playCue('ready'); };
+          window.speechSynthesis.speak(utterance);
+          setIsPlaying(true);
+          return;
+        }
+
         playCue('ready');
       }, [loadFromCache, playCue, storyTitle]);
 
@@ -3597,18 +3604,22 @@
       const ua = navigator.userAgent || '';
       const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
-      // iOS Safari can get stuck in a bad SW/cache state that repeatedly crashes page load.
-      // For stability, disable SW on iOS and clean up any previous registration.
+      // iOS Safari: only unregister old SW registrations — do NOT wipe the CDN/
+      // font/script caches since that forces re-download of Babel, React etc. on
+      // every page load, causing timeout crashes on slow connections.
       if (isIOS) {
         window.addEventListener('load', async () => {
           try {
             const regs = await navigator.serviceWorker.getRegistrations();
             await Promise.all(regs.map(r => r.unregister()));
+            // Only delete the StoryTap app cache, not browser-managed CDN caches
             if (window.caches && caches.keys) {
               const names = await caches.keys();
-              await Promise.all(names.map(name => caches.delete(name)));
+              await Promise.all(
+                names.filter(n => n.startsWith('storytap')).map(name => caches.delete(name))
+              );
             }
-            console.log('iOS mode: service worker disabled and old caches cleared');
+            console.log('iOS mode: old SW unregistered, storytap caches cleared');
           } catch (e) {
             console.warn('iOS SW cleanup failed:', e);
           }
