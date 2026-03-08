@@ -1932,8 +1932,32 @@
           if (enVoice) utterance.voice = enVoice;
           utterance.rate = 0.88;
           utterance.pitch = 1.0;
-          utterance.onend = () => { setIsPlaying(false); playCue('ready'); };
-          utterance.onerror = () => { setIsPlaying(false); playCue('ready'); };
+
+          // iOS WebKit bug: speechSynthesis can stall silently (onend never fires)
+          // after screen dim or backgrounding. Watchdog resumes/recovers after timeout.
+          let finished = false;
+          const wordCount = text.split(/\s+/).length;
+          // Generous estimate: words / (rate * ~2.5 words/sec) + 4s buffer
+          const timeoutMs = Math.max(8000, (wordCount / (0.88 * 2.5)) * 1000 + 4000);
+          const watchdog = setTimeout(() => {
+            if (!finished) {
+              finished = true;
+              window.speechSynthesis.cancel();
+              setIsPlaying(false);
+              playCue('ready');
+            }
+          }, timeoutMs);
+
+          const done = () => {
+            if (!finished) {
+              finished = true;
+              clearTimeout(watchdog);
+              setIsPlaying(false);
+              playCue('ready');
+            }
+          };
+          utterance.onend = done;
+          utterance.onerror = done;
           window.speechSynthesis.speak(utterance);
           setIsPlaying(true);
           return;
