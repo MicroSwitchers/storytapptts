@@ -1618,9 +1618,10 @@
       const [allowSkip, setAllowSkip] = useState(prefs.allowSkip ?? false);
       const [showEditControls, setShowEditControls] = useState(false);
 
-      // iOS: user-chosen narration voice (empty string = auto-pick best)
-      // Default: 'American Voice 3' — one of Apple's new high-quality Siri voices (iOS 16+)
-      const [iosVoiceName, setIosVoiceName] = useState(prefs.iosVoiceName !== undefined ? prefs.iosVoiceName : 'American Voice 3');
+      // iOS: user-chosen narration voice (empty string = auto-pick best Siri/Neural voice)
+      // We cannot hardcode a display name — Siri voice names vary by iOS version and device locale.
+      // Detection uses voiceURI which reliably contains 'siri_' for Apple's premium neural voices.
+      const [iosVoiceName, setIosVoiceName] = useState(prefs.iosVoiceName !== undefined ? prefs.iosVoiceName : '');
       const [availableIOSVoices, setAvailableIOSVoices] = useState([]);
       const [storyColor, setStoryColor] = useState('indigo');
 
@@ -1651,7 +1652,18 @@
         if (!deviceInfoRef.current?.isIOS || !window.speechSynthesis) return;
         const load = () => {
           const all = window.speechSynthesis.getVoices();
-          const english = all.filter(v => v.lang.startsWith('en') && v.localService);
+          // Sort: Siri neural (voiceURI contains siri_) > Premium label > Enhanced label > rest
+          const english = all
+            .filter(v => v.lang.startsWith('en') && v.localService)
+            .sort((a, b) => {
+              const score = v => {
+                if (v.voiceURI && v.voiceURI.includes('siri_')) return 3;
+                if (v.name.includes('Premium')) return 2;
+                if (v.name.includes('Enhanced')) return 1;
+                return 0;
+              };
+              return score(b) - score(a);
+            });
           if (english.length > 0) setAvailableIOSVoices(english);
         };
         load();
@@ -1976,32 +1988,41 @@
           const voices = window.speechSynthesis.getVoices();
 
           // Pick the highest-quality English voice available.
-          // iOS 16+ ships "Premium" and "Enhanced" Siri voices that sound much better
-          // than the base "Samantha". Strategy:
-          //   1. Any en-US local voice with "Premium" in the name
-          //   2. Any English local voice with "Premium" in the name
-          //   3. Any en-US local voice with "Enhanced" in the name
-          //   4. Any English local voice with "Enhanced" in the name
-          //   5. Classic Samantha / Daniel / Karen / Moira (still neural, just older)
-          //   6. Any en-US local voice
-          //   7. Any English local voice
-          //   8. Any English voice
+          // iOS 16+ ships "Siri" neural voices (AVSpeechSynthesisVoiceQuality.premium tier).
+          // The Web Speech API does NOT expose a quality property, but Apple's Siri neural
+          // voice identifiers reliably contain 'siri_' in voiceURI (e.g. com.apple.ttsbundle.siri_Hattie_en-US_compact).
+          // Checking voiceURI is therefore the correct detection method per the native AVFoundation docs.
+          // Priority:
+          //   1. User's explicit pick (exact name match)
+          //   2. Siri neural voice (voiceURI has 'siri_'), en-US
+          //   3. Siri neural voice, any English
+          //   4. 'Premium' in name, en-US
+          //   5. 'Premium' in name, any English
+          //   6. 'Enhanced' in name, en-US
+          //   7. 'Enhanced' in name, any English
+          //   8. Classic named neural (Samantha/Daniel/Ava etc.)
+          //   9. Any en-US local
+          //  10. Any English local
+          //  11. Any English
           const enUS   = (v) => v.lang === 'en-US';
           const enAny  = (v) => v.lang.startsWith('en');
           const local  = (v) => v.localService;
+          const isSiri = (v) => v.voiceURI && v.voiceURI.includes('siri_');
           const prem   = (v) => v.name.includes('Premium');
           const enh    = (v) => v.name.includes('Enhanced');
-          const named  = (v) => ['American Voice 3','Voice 3','Samantha','Daniel','Karen','Moira','Zoe','Tom','Nicky','Ava'].some(n => v.name.includes(n));
+          const named  = (v) => ['Samantha','Daniel','Karen','Moira','Zoe','Tom','Nicky','Ava'].some(n => v.name.includes(n));
 
           const enVoice =
             (iosVoiceName && voices.find(v => v.name === iosVoiceName)) ||
-            voices.find(v => enUS(v)  && local(v) && prem(v)) ||
-            voices.find(v => enAny(v) && local(v) && prem(v)) ||
-            voices.find(v => enUS(v)  && local(v) && enh(v))  ||
-            voices.find(v => enAny(v) && local(v) && enh(v))  ||
-            voices.find(v => enAny(v) && local(v) && named(v))||
-            voices.find(v => enUS(v)  && local(v))            ||
-            voices.find(v => enAny(v) && local(v))            ||
+            voices.find(v => enUS(v)  && local(v) && isSiri(v)) ||
+            voices.find(v => enAny(v) && local(v) && isSiri(v)) ||
+            voices.find(v => enUS(v)  && local(v) && prem(v))   ||
+            voices.find(v => enAny(v) && local(v) && prem(v))   ||
+            voices.find(v => enUS(v)  && local(v) && enh(v))    ||
+            voices.find(v => enAny(v) && local(v) && enh(v))    ||
+            voices.find(v => enAny(v) && local(v) && named(v))  ||
+            voices.find(v => enUS(v)  && local(v))              ||
+            voices.find(v => enAny(v) && local(v))              ||
             voices.find(v => enAny(v)) || null;
 
           if (enVoice) utterance.voice = enVoice;
@@ -2540,18 +2561,22 @@
                     >
                       <div>
                         <div className={`font-semibold text-sm ${currentTheme.textMain}`}>Auto (Best Available)</div>
-                        <div className={`text-xs ${currentTheme.textSub}`}>Picks the highest-quality voice</div>
+                        <div className={`text-xs ${currentTheme.textSub}`}>Prefers Siri neural voices automatically</div>
                       </div>
                       {iosVoiceName === '' && <Check size={16} className={`text-${currentTheme.highlight}-500 flex-shrink-0`} />}
                     </button>
-                    {/* Per-voice options */}
+                    {/* Per-voice options — sorted: Siri neural > Premium > Enhanced > rest */}
                     <div className="max-h-52 overflow-y-auto">
                       {availableIOSVoices.map((v, i) => {
-                        const isPrem = v.name.includes('Premium');
-                        const isEnh  = v.name.includes('Enhanced');
-                        const badgeClass = isPrem
-                          ? (theme.includes('high-contrast') ? 'bg-zinc-600 text-zinc-100' : 'bg-violet-100 text-violet-700')
-                          : (theme.includes('high-contrast') ? 'bg-zinc-700 text-zinc-200' : 'bg-sky-100 text-sky-700');
+                        // Detect quality tier: Siri neural voices have 'siri_' in voiceURI
+                        // (matches AVSpeechSynthesisVoiceQuality.premium in AVFoundation)
+                        const isSiriV = v.voiceURI && v.voiceURI.includes('siri_');
+                        const isPremV = !isSiriV && v.name.includes('Premium');
+                        const isEnhV  = !isSiriV && !isPremV && v.name.includes('Enhanced');
+                        const badge = isSiriV ? { label: 'Siri', hc: 'bg-zinc-600 text-zinc-100', std: 'bg-purple-100 text-purple-700' }
+                                    : isPremV ? { label: 'Premium', hc: 'bg-zinc-600 text-zinc-100', std: 'bg-violet-100 text-violet-700' }
+                                    : isEnhV  ? { label: 'Enhanced', hc: 'bg-zinc-700 text-zinc-200', std: 'bg-sky-100 text-sky-700' }
+                                    : null;
                         return (
                           <button
                             key={v.name}
@@ -2560,9 +2585,9 @@
                           >
                             <div className="flex items-center gap-2 flex-1 min-w-0">
                               <span className={`text-sm font-medium truncate ${currentTheme.textMain}`}>{v.name}</span>
-                              {(isPrem || isEnh) && (
-                                <span className={`text-xs px-1.5 py-0.5 rounded font-semibold flex-shrink-0 ${badgeClass}`}>
-                                  {isPrem ? 'Premium' : 'Enhanced'}
+                              {badge && (
+                                <span className={`text-xs px-1.5 py-0.5 rounded font-semibold flex-shrink-0 ${theme.includes('high-contrast') ? badge.hc : badge.std}`}>
+                                  {badge.label}
                                 </span>
                               )}
                             </div>
