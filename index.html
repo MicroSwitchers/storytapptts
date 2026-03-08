@@ -1622,6 +1622,8 @@
       // We cannot hardcode a display name — Siri voice names vary by iOS version and device locale.
       // Detection uses voiceURI which reliably contains 'siri_' for Apple's premium neural voices.
       const [iosVoiceName, setIosVoiceName] = useState(prefs.iosVoiceName !== undefined ? prefs.iosVoiceName : '');
+      const iosVoiceNameRef = useRef(iosVoiceName); // Ref so playSentence never captures a stale closure
+      useEffect(() => { iosVoiceNameRef.current = iosVoiceName; }, [iosVoiceName]);
       const [availableIOSVoices, setAvailableIOSVoices] = useState([]);
       const [storyColor, setStoryColor] = useState('indigo');
 
@@ -2013,7 +2015,7 @@
           const named  = (v) => ['Samantha','Daniel','Karen','Moira','Zoe','Tom','Nicky','Ava'].some(n => v.name.includes(n));
 
           const enVoice =
-            (iosVoiceName && voices.find(v => v.name === iosVoiceName)) ||
+            (iosVoiceNameRef.current && voices.find(v => v.name === iosVoiceNameRef.current)) ||
             voices.find(v => enUS(v)  && local(v) && isSiri(v)) ||
             voices.find(v => enAny(v) && local(v) && isSiri(v)) ||
             voices.find(v => enUS(v)  && local(v) && prem(v))   ||
