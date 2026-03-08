@@ -1512,8 +1512,18 @@
       };
 
       // Only allow playing stories that are fully cached (downloaded)
+      // Exception: iOS uses live speechSynthesis — no download needed, always playable
       const loadBookForPlay = (story) => {
-        if (story.status !== 'cached') return; // Must download first!
+        const isIOS = deviceInfoRef.current?.isIOS;
+        if (story.status !== 'cached') {
+          if (isIOS) {
+            // Mark as cached immediately — iOS plays everything live via speechSynthesis
+            setLibrary(prev => prev.map(s => s.id === story.id
+              ? { ...s, status: 'cached', progress: 100, progressText: null } : s));
+          } else {
+            return; // Non-iOS: must download first
+          }
+        }
         // Stop carousel title announcement before entering reading mode
         if (carouselAudioRef.current) {
           try { carouselAudioRef.current.pause(); carouselAudioRef.current.currentTime = 0; } catch (e) { }
@@ -2698,8 +2708,11 @@
           const isCached = story.status === 'cached';
 
           // Smart click handler: Play if cached, Download if not (and unlocked)
+          // iOS: always go straight to play (speechSynthesis handles it live, no download needed)
           const handleCardClick = (e) => {
-            if (showEditControls && !isCached && !isProcessing) {
+            if (device.isIOS) {
+              loadBookForPlay(story);
+            } else if (showEditControls && !isCached && !isProcessing) {
               preloadBook(story, e);
             } else {
               loadBookForPlay(story);
@@ -2709,7 +2722,7 @@
           return (
             <div key={story.id}
               onClick={handleCardClick}
-              className={`aspect-[3/4] relative rounded-3xl overflow-hidden shadow-xl transition-all group flex flex-col border-4 border-slate-900 ${currentTheme.cardBg} ${isCached ? 'cursor-pointer hover:scale-[1.02] hover:shadow-2xl' : 'cursor-default opacity-90 grayscale-[0.3]'}`}
+              className={`aspect-[3/4] relative rounded-3xl overflow-hidden shadow-xl transition-all group flex flex-col border-4 border-slate-900 ${currentTheme.cardBg} ${(isCached || device.isIOS) ? 'cursor-pointer hover:scale-[1.02] hover:shadow-2xl' : 'cursor-default opacity-90 grayscale-[0.3]'}`}
             >
               {/* Colored Header: Title */}
               <div className={`flex-1 p-6 flex items-center justify-center text-center relative ${headerColor}`}>
@@ -2736,7 +2749,7 @@
                           <X size={18} />
                         </button>
                       </div>
-                    ) : isCached ? (
+                    ) : (isCached || device.isIOS) ? (
                       <div className="flex items-center gap-2" style={{ color: { yellow: '#facc15', red: '#ef4444', green: '#10b981', orange: '#f97316', purple: '#a855f7', blue: '#3b82f6' }[boundaryColor] || '#facc15' }}>
                         <div className="p-2.5 rounded-xl bg-white/10">
                           <Play size={26} fill="currentColor" />
@@ -2889,7 +2902,12 @@
                     <div className={`w-12 h-12 rounded-xl bg-indigo-600 flex items-center justify-center shadow-lg text-white`}>
                       <BookOpen size={24} />
                     </div>
-                    <h1 className={`text-3xl font-bold font-serif ${currentTheme.textMain} tracking-tight`}>StoryTap</h1>
+                    <div>
+                      <h1 className={`text-3xl font-bold font-serif ${currentTheme.textMain} tracking-tight leading-none`}>StoryTap</h1>
+                      <span className={`text-xs font-bold px-2 py-0.5 rounded-full mt-0.5 inline-block ${device.isIOS ? 'bg-emerald-500/20 text-emerald-400' : 'bg-indigo-500/20 text-indigo-400'}`}>
+                        {device.isIOS ? '🎙 Live Voice' : '🤖 Kyutai AI'}
+                      </span>
+                    </div>
                   </>
                 )}
               </div>
