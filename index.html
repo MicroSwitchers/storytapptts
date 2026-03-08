@@ -1654,9 +1654,19 @@
         if (!deviceInfoRef.current?.isIOS || !window.speechSynthesis) return;
         const load = () => {
           const all = window.speechSynthesis.getVoices();
-          // Sort: Siri neural (voiceURI contains siri_) > Premium label > Enhanced label > rest
-          const english = all
-            .filter(v => v.lang.startsWith('en') && v.localService)
+          // Only show high-quality voices: Siri neural (voiceURI has 'siri_'),
+          // or names containing 'Premium' / 'Enhanced'. Drops old compact/default
+          // voices like Samantha (baseline quality).
+          const highQuality = all
+            .filter(v =>
+              v.lang.startsWith('en') &&
+              v.localService &&
+              (
+                (v.voiceURI && v.voiceURI.includes('siri_')) ||
+                v.name.includes('Premium') ||
+                v.name.includes('Enhanced')
+              )
+            )
             .sort((a, b) => {
               const score = v => {
                 if (v.voiceURI && v.voiceURI.includes('siri_')) return 3;
@@ -1666,7 +1676,7 @@
               };
               return score(b) - score(a);
             });
-          if (english.length > 0) setAvailableIOSVoices(english);
+          if (highQuality.length > 0) setAvailableIOSVoices(highQuality);
         };
         load();
         const prev = window.speechSynthesis.onvoiceschanged;
