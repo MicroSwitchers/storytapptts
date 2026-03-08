@@ -1058,7 +1058,10 @@
       const [rawText, setRawText] = useState(prefs.rawText || DEFAULT_STORY_TEXT);
       const [sentences, setSentences] = useState([]);
       const [currentIndex, setCurrentIndex] = useState(-1);
-      const [voice, setVoice] = useState(prefs.voice || VOICES[0].name);
+      // Validate saved voice against known list — stale prefs (e.g. 'af_heart' from old versions)
+      // cause a 404 when fetching the voice embedding from HuggingFace.
+      const savedVoice = prefs.voice && VOICES.find(v => v.name === prefs.voice) ? prefs.voice : VOICES[0].name;
+      const [voice, setVoice] = useState(savedVoice);
       const speed = NATURAL_SPEED; // Locked to 1.0 for proper pronunciation
       const [isTransitioning, setIsTransitioning] = useState(false);
 
@@ -1950,12 +1953,35 @@
           window.speechSynthesis.cancel();
           const utterance = new SpeechSynthesisUtterance(text);
           const voices = window.speechSynthesis.getVoices();
-          const preferred = voices.find(v => v.name.includes('Samantha') || v.name.includes('Daniel') ||
-            v.name.includes('Karen') || v.name.includes('Moira'));
-          const enVoice = preferred ||
-            voices.find(v => v.lang === 'en-US' && v.localService) ||
-            voices.find(v => v.lang.startsWith('en') && v.localService) ||
-            voices.find(v => v.lang.startsWith('en')) || null;
+
+          // Pick the highest-quality English voice available.
+          // iOS 16+ ships "Premium" and "Enhanced" Siri voices that sound much better
+          // than the base "Samantha". Strategy:
+          //   1. Any en-US local voice with "Premium" in the name
+          //   2. Any English local voice with "Premium" in the name
+          //   3. Any en-US local voice with "Enhanced" in the name
+          //   4. Any English local voice with "Enhanced" in the name
+          //   5. Classic Samantha / Daniel / Karen / Moira (still neural, just older)
+          //   6. Any en-US local voice
+          //   7. Any English local voice
+          //   8. Any English voice
+          const enUS   = (v) => v.lang === 'en-US';
+          const enAny  = (v) => v.lang.startsWith('en');
+          const local  = (v) => v.localService;
+          const prem   = (v) => v.name.includes('Premium');
+          const enh    = (v) => v.name.includes('Enhanced');
+          const named  = (v) => ['Samantha','Daniel','Karen','Moira','Zoe','Tom','Nicky','Ava'].some(n => v.name.includes(n));
+
+          const enVoice =
+            voices.find(v => enUS(v)  && local(v) && prem(v)) ||
+            voices.find(v => enAny(v) && local(v) && prem(v)) ||
+            voices.find(v => enUS(v)  && local(v) && enh(v))  ||
+            voices.find(v => enAny(v) && local(v) && enh(v))  ||
+            voices.find(v => enAny(v) && local(v) && named(v))||
+            voices.find(v => enUS(v)  && local(v))            ||
+            voices.find(v => enAny(v) && local(v))            ||
+            voices.find(v => enAny(v)) || null;
+
           if (enVoice) utterance.voice = enVoice;
           utterance.rate = 0.88;
           utterance.pitch = 1.0;
