@@ -1217,10 +1217,10 @@
           storyTitle, rawText, voice, textSize, theme,
           soundCuesEnabled, vibrationEnabled, allowSkip,
           showBoundary, boundaryColor, showTitlePage, endAction,
-          unlockAction
+          unlockAction, iosVoiceName
         };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-      }, [storyTitle, rawText, voice, textSize, theme, soundCuesEnabled, vibrationEnabled, allowSkip, showBoundary, boundaryColor, showTitlePage, endAction, unlockAction]);
+      }, [storyTitle, rawText, voice, textSize, theme, soundCuesEnabled, vibrationEnabled, allowSkip, showBoundary, boundaryColor, showTitlePage, endAction, unlockAction, iosVoiceName]);
 
       // Send OS notification (PWA/Browser) — only sends if permission already granted
       const sendNotification = async (title, body) => {
@@ -1617,6 +1617,10 @@
       const [textSize, setTextSize] = useState(prefs.textSize || 'huge');
       const [allowSkip, setAllowSkip] = useState(prefs.allowSkip ?? false);
       const [showEditControls, setShowEditControls] = useState(false);
+
+      // iOS: user-chosen narration voice (empty string = auto-pick best)
+      const [iosVoiceName, setIosVoiceName] = useState(prefs.iosVoiceName || '');
+      const [availableIOSVoices, setAvailableIOSVoices] = useState([]);
       const [storyColor, setStoryColor] = useState('indigo');
 
       // Exit button hold state
@@ -1640,6 +1644,22 @@
       const deviceInfoRef = useRef(getDeviceInfo());
       const device = deviceInfoRef.current; // Shortcut for inline use in JSX
       const initPromiseRef = useRef(null);
+
+      // Populate iOS voice list once on mount so the settings picker has choices
+      useEffect(() => {
+        if (!deviceInfoRef.current?.isIOS || !window.speechSynthesis) return;
+        const load = () => {
+          const all = window.speechSynthesis.getVoices();
+          const english = all.filter(v => v.lang.startsWith('en') && v.localService);
+          if (english.length > 0) setAvailableIOSVoices(english);
+        };
+        load();
+        const prev = window.speechSynthesis.onvoiceschanged;
+        window.speechSynthesis.onvoiceschanged = () => {
+          load();
+          window.speechSynthesis.onvoiceschanged = prev;
+        };
+      }, []);
       const libraryBlockRef = useRef(0); // Timestamp to block library clicks after exit
 
       const { play: playCue } = useAudioCues(soundCuesEnabled, vibrationEnabled);
@@ -1973,6 +1993,7 @@
           const named  = (v) => ['Samantha','Daniel','Karen','Moira','Zoe','Tom','Nicky','Ava'].some(n => v.name.includes(n));
 
           const enVoice =
+            (iosVoiceName && voices.find(v => v.name === iosVoiceName)) ||
             voices.find(v => enUS(v)  && local(v) && prem(v)) ||
             voices.find(v => enAny(v) && local(v) && prem(v)) ||
             voices.find(v => enUS(v)  && local(v) && enh(v))  ||
@@ -2497,6 +2518,61 @@
                   <div className={`absolute top-0.5 w-6 h-6 rounded-full shadow transition-all ${allowSkip ? 'left-7' : 'left-0.5'} ${theme.includes('high-contrast') ? 'bg-black' : 'bg-white'}`} />
                 </button>
               </div>
+
+              {/* iOS Narration Voice Picker */}
+              {device.isIOS && availableIOSVoices.length > 0 && (
+                <div className={`space-y-3 pt-4 border-t ${currentTheme.border}`}>
+                  <div className="flex items-center gap-3">
+                    <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${theme.includes('high-contrast') ? `border ${currentTheme.border}` : 'bg-violet-100'}`}>
+                      <Volume2 size={20} className={theme.includes('high-contrast') ? currentTheme.textMain : 'text-violet-600'} />
+                    </div>
+                    <div>
+                      <div className={`font-bold ${currentTheme.textMain}`}>Reading Voice</div>
+                      <div className={`text-sm ${currentTheme.textSub}`}>Choose your narrator</div>
+                    </div>
+                  </div>
+                  <div className={`rounded-xl border overflow-hidden ${currentTheme.border}`}>
+                    {/* Auto option */}
+                    <button
+                      onClick={() => setIosVoiceName('')}
+                      className={`w-full flex items-center justify-between px-4 py-3 text-left transition-colors border-b ${currentTheme.border} ${iosVoiceName === '' ? `${currentTheme.highlightBgLight}` : `${theme.includes('high-contrast') ? 'hover:bg-zinc-700' : 'hover:bg-slate-50'}`} ${currentTheme.cardBg}`}
+                    >
+                      <div>
+                        <div className={`font-semibold text-sm ${currentTheme.textMain}`}>Auto (Best Available)</div>
+                        <div className={`text-xs ${currentTheme.textSub}`}>Picks the highest-quality voice</div>
+                      </div>
+                      {iosVoiceName === '' && <Check size={16} className={`text-${currentTheme.highlight}-500 flex-shrink-0`} />}
+                    </button>
+                    {/* Per-voice options */}
+                    <div className="max-h-52 overflow-y-auto">
+                      {availableIOSVoices.map((v, i) => {
+                        const isPrem = v.name.includes('Premium');
+                        const isEnh  = v.name.includes('Enhanced');
+                        const badgeClass = isPrem
+                          ? (theme.includes('high-contrast') ? 'bg-zinc-600 text-zinc-100' : 'bg-violet-100 text-violet-700')
+                          : (theme.includes('high-contrast') ? 'bg-zinc-700 text-zinc-200' : 'bg-sky-100 text-sky-700');
+                        return (
+                          <button
+                            key={v.name}
+                            onClick={() => setIosVoiceName(v.name)}
+                            className={`w-full flex items-center justify-between px-4 py-3 text-left transition-colors ${i < availableIOSVoices.length - 1 ? `border-b ${currentTheme.border}` : ''} ${iosVoiceName === v.name ? `${currentTheme.highlightBgLight}` : `${theme.includes('high-contrast') ? 'hover:bg-zinc-700' : 'hover:bg-slate-50'}`} ${currentTheme.cardBg}`}
+                          >
+                            <div className="flex items-center gap-2 flex-1 min-w-0">
+                              <span className={`text-sm font-medium truncate ${currentTheme.textMain}`}>{v.name}</span>
+                              {(isPrem || isEnh) && (
+                                <span className={`text-xs px-1.5 py-0.5 rounded font-semibold flex-shrink-0 ${badgeClass}`}>
+                                  {isPrem ? 'Premium' : 'Enhanced'}
+                                </span>
+                              )}
+                            </div>
+                            {iosVoiceName === v.name && <Check size={16} className={`text-${currentTheme.highlight}-500 flex-shrink-0 ml-2`} />}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Visual Theme */}
               <div className="space-y-3">
