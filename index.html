@@ -1295,19 +1295,8 @@
             setMode('library');
           }
 
-          // iOS: WASM inference crashes Safari — skip generation entirely.
-          // The story is marked 'cached' immediately; playSentence uses speechSynthesis inline.
-          const isMobile = device.isMobile;
-          const isIOS = device.isIOS;
-          if (isIOS) {
-            setLibrary(prev => prev.map(s => s.id === story.id
-              ? { ...s, status: 'cached', progress: 100, progressText: null } : s));
-            processingRef.current = null;
-            playCue('download_done');
-            return;
-          }
-
           // Mobile-aware pacing: yield between items to keep UI responsive
+          const isMobile = device.isMobile;
           // Single delay per item — enough to prevent ANR without freezing progress
           const ITEM_DELAY = isMobile ? 150 : 30;
           // Extra pause every N items to let GC run
@@ -1617,6 +1606,8 @@
       const deviceInfoRef = useRef(getDeviceInfo());
       const device = deviceInfoRef.current; // Shortcut for inline use in JSX
       const initPromiseRef = useRef(null);
+      const workerRef = useRef(null);         // Web Worker for iOS (keeps WASM off main thread)
+      const workerCallbacksRef = useRef({}); // Pending {resolve,reject} keyed by message id
       const libraryBlockRef = useRef(0); // Timestamp to block library clicks after exit
 
       const { play: playCue } = useAudioCues(soundCuesEnabled, vibrationEnabled);
@@ -1635,10 +1626,47 @@
       };
 
       // =============================================
-      // POCKET TTS ENGINE (WASM, main thread)
+      // POCKET TTS ENGINE (WASM)
       // Model: kyutai/pocket-tts (MIT) — 100M params, 240MB one-time download
-      // Runs on the main thread via dynamic import() — avoids file:// Worker restrictions.
+      // iOS: runs in a Web Worker (avoids blocking main thread → prevents Safari kill)
+      // Android/Desktop: runs on main thread via dynamic import()
       // =============================================
+
+      // Create (or reuse) the Web Worker for iOS.
+      // Routes worker messages to React state and to pending Promise callbacks.
+      const initWorker = useCallback(() => {
+        if (workerRef.current) return workerRef.current;
+        const worker = new Worker('pocket-tts-worker.js', { type: 'module' });
+        worker.onmessage = (e) => {
+          const { type, id, wavData, message, pct, detail } = e.data;
+          if (type === 'progress') {
+            if (typeof pct === 'number' && pct >= 0) setModelProgress(prev => Math.max(prev, Math.min(pct, 99)));
+            if (detail) setModelStatus(detail);
+          } else if (type === 'status') {
+            if (message) setModelStatus(message);
+          } else if (type === 'loaded') {
+            const cb = workerCallbacksRef.current['__load__'];
+            if (cb) { delete workerCallbacksRef.current['__load__']; cb.resolve(true); }
+          } else if (type === 'audio_complete') {
+            const cb = workerCallbacksRef.current[id];
+            if (cb) { delete workerCallbacksRef.current[id]; cb.resolve(wavData); }
+          } else if (type === 'error') {
+            const key = id || '__load__';
+            const cb = workerCallbacksRef.current[key];
+            if (cb) { delete workerCallbacksRef.current[key]; cb.reject(new Error(message || 'Worker error')); }
+          }
+        };
+        worker.onerror = (err) => {
+          console.error('TTS Worker crashed:', err);
+          Object.keys(workerCallbacksRef.current).forEach(k => {
+            workerCallbacksRef.current[k]?.reject?.(new Error('Worker crashed'));
+            delete workerCallbacksRef.current[k];
+          });
+          workerRef.current = null; // Allow re-init on next attempt
+        };
+        workerRef.current = worker;
+        return worker;
+      }, []);
 
       const loadPocketTTSModel = useCallback(async () => {
         if (ttsRef.current) return true;
@@ -1649,7 +1677,21 @@
           setModelProgress(0);
           setModelStatus('Loading speech engine...');
           try {
-            // Load the WASM JS glue via dynamic import (same pattern as old Kokoro code)
+            // iOS: load via Web Worker — keeps WASM inference off the main thread
+            if (deviceInfoRef.current.isIOS) {
+              const worker = initWorker();
+              await new Promise((resolve, reject) => {
+                workerCallbacksRef.current['__load__'] = { resolve, reject };
+                worker.postMessage({ type: 'load', voice });
+              });
+              ttsRef.current = true;
+              setModelProgress(100);
+              setModelStatus('Ready');
+              console.log('Pocket TTS (Worker) loaded on iOS');
+              return true;
+            }
+
+            // Android / Desktop: load inline on main thread
             const { default: initWasm, Model } = await import(PTT_WASM_JS);
 
             // Fetch tokenizer
@@ -1791,6 +1833,23 @@
           if (!success) return null;
         }
 
+        // iOS: generate via Worker (WASM runs off the main thread)
+        if (deviceInfoRef.current.isIOS && workerRef.current) {
+          const genId = `gen_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+          try {
+            const wavBuffer = await new Promise((resolve, reject) => {
+              workerCallbacksRef.current[genId] = { resolve, reject };
+              workerRef.current.postMessage({ type: 'generate', text: cleanText, voice: useVoice, id: genId });
+            });
+            const wavBlob = new Blob([wavBuffer], { type: 'audio/wav' });
+            await setCachedAudio(cacheKey, wavBlob).catch(() => {});
+            return URL.createObjectURL(wavBlob);
+          } catch (workerErr) {
+            console.error('Worker generation error:', workerErr);
+            return null;
+          }
+        }
+
         try {
           await yieldToBrowser();
 
@@ -1903,22 +1962,6 @@
               error: audioRef.current.error?.message
             });
           }
-        }
-
-        // No cached audio — on iOS use speechSynthesis fallback (WASM is skipped on iOS)
-        if (!url && deviceInfoRef.current?.isIOS && window.speechSynthesis) {
-          const utterance = new SpeechSynthesisUtterance(text);
-          // Pick an English voice if available
-          const voices = window.speechSynthesis.getVoices();
-          const enVoice = voices.find(v => v.lang.startsWith('en-') && v.localService) ||
-                          voices.find(v => v.lang.startsWith('en')) || null;
-          if (enVoice) utterance.voice = enVoice;
-          utterance.rate = 0.9;
-          utterance.onend = () => { setIsPlaying(false); playCue('ready'); };
-          utterance.onerror = () => { setIsPlaying(false); playCue('ready'); };
-          window.speechSynthesis.speak(utterance);
-          setIsPlaying(true);
-          return;
         }
 
         if (!url) {
