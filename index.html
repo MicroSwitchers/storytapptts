@@ -666,25 +666,42 @@
 
           request.onsuccess = () => {
             const result = request.result;
+            if (!result || !result.blob) {
+              console.log('Cache miss for key:', key.substring(0, 80));
+            }
             resolve(result ? result.blob : null);
           };
-          request.onerror = () => resolve(null);
+          request.onerror = () => {
+            console.error('IndexedDB get error:', request.error);
+            resolve(null);
+          };
 
           tx.onerror = () => {
-            console.warn('IndexedDB transaction error:', tx.error);
+            console.error('IndexedDB transaction error:', tx.error);
             resolve(null);
           };
           tx.onabort = () => {
-            console.warn('IndexedDB transaction aborted');
+            console.error('IndexedDB transaction aborted');
             resolve(null);
           };
         });
-      } catch (e) { return null; }
+      } catch (e) { 
+        console.error('getCachedAudio failed:', e);
+        return null; 
+      }
     };
 
     const setCachedAudio = async (key, blob) => {
       try {
         const db = await openDB();
+
+        // Validate blob before saving
+        if (!blob || blob.size === 0) {
+          console.error('Attempted to cache invalid blob:', { key: key.substring(0, 80), blobSize: blob?.size });
+          return false;
+        }
+
+        console.log('Caching audio:', { key: key.substring(0, 80), blobSize: blob.size });
 
         // Write the audio in a short, focused transaction (iOS-safe)
         await new Promise((resolve, reject) => {
@@ -692,8 +709,14 @@
           const store = tx.objectStore(STORE_NAME);
           store.put({ key, blob, ts: Date.now() });
           tx.oncomplete = () => resolve(true);
-          tx.onerror = () => reject(tx.error);
-          tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
+          tx.onerror = () => {
+            console.error('IndexedDB write error:', tx.error);
+            reject(tx.error);
+          };
+          tx.onabort = () => {
+            console.error('IndexedDB write aborted:', tx.error);
+            reject(tx.error || new Error('Transaction aborted'));
+          };
         });
 
         // Periodic cleanup in a SEPARATE transaction (prevents iOS timeout)
@@ -1247,6 +1270,12 @@
             return;
           }
 
+          // Check available memory on mobile devices (if supported)
+          const device = deviceInfoRef.current;
+          if (device.isMobile && navigator.deviceMemory && navigator.deviceMemory < 2) {
+            console.warn('Low memory device detected:', navigator.deviceMemory, 'GB');
+          }
+
           // Ensure model is loaded before we start downloading
           if (!ttsRef.current) {
             // Show the loading screen so the user can see model download progress
@@ -1267,7 +1296,6 @@
           }
 
           // Mobile-aware pacing: yield between items to keep UI responsive
-          const device = deviceInfoRef.current;
           const isMobile = device.isMobile;
           const isIOS = device.isIOS;
           // Single delay per item — enough to prevent ANR without freezing progress
@@ -1296,7 +1324,22 @@
 
             try {
               // Generate and cache audio (uses story's voice, speed locked to NATURAL_SPEED)
-              await generatePocketTTSAudio(allItemsToCache[i], story.voice, NATURAL_SPEED, true);
+              const audioUrl = await generatePocketTTSAudio(allItemsToCache[i], story.voice, NATURAL_SPEED, true);
+              
+              // Verify the audio was actually cached and can be retrieved (Android fix)
+              if (audioUrl) {
+                const cacheKey = getCacheKey(cleanTextForTTS(allItemsToCache[i]), story.voice, NATURAL_SPEED);
+                const cachedBlob = await getCachedAudio(cacheKey);
+                if (!cachedBlob) {
+                  console.error('Audio generated but not found in cache:', allItemsToCache[i].substring(0, 50));
+                  throw new Error('Cache verification failed');
+                }
+                // Release the URL to prevent memory leaks
+                URL.revokeObjectURL(audioUrl);
+              } else {
+                throw new Error('Audio generation returned null');
+              }
+              
               consecutiveErrors = 0; // Reset on success
             } catch (e) {
               console.warn('Error caching item:', e);
@@ -1750,13 +1793,27 @@
           await pttLoadVoice(useVoice);
           const voiceIndex = pttState.voiceIndexMap[useVoice];
 
-          // Synchronous WASM generation (blocks briefly but acceptable during Download)
+          // WASM generation with yields to prevent iOS crashes
           const [processedText, framesAfterEos] = pttState.model.prepare_text(cleanText);
           const tokenIds = pttState.tokenizer.encode(processedText);
           pttState.model.start_generation(voiceIndex, tokenIds, framesAfterEos, 0.7);
 
           const chunks = [];
-          while (true) { const chunk = pttState.model.generation_step(); if (!chunk) break; chunks.push(chunk); }
+          let stepCount = 0;
+          const YIELD_INTERVAL = deviceInfoRef.current?.isIOS ? 10 : 50; // Yield more frequently on iOS
+          
+          while (true) { 
+            const chunk = pttState.model.generation_step(); 
+            if (!chunk) break; 
+            chunks.push(chunk); 
+            stepCount++;
+            
+            // Yield to browser periodically to prevent timeouts/crashes on mobile
+            if (stepCount % YIELD_INTERVAL === 0) {
+              await new Promise(r => setTimeout(r, 0));
+            }
+          }
+          
           const totalLen = chunks.reduce((s, c) => s + c.length, 0);
           const allPcm = new Float32Array(totalLen);
           let off = 0; for (const c of chunks) { allPcm.set(c, off); off += c.length; }
@@ -1764,11 +1821,23 @@
           const wavBuffer = pttEncodeWav(allPcm, 24000);
           const wavBlob = new Blob([wavBuffer], { type: 'audio/wav' });
 
-          await setCachedAudio(cacheKey, wavBlob).catch(() => { });
+          // Save to cache with explicit error handling for Android
+          const cacheSuccess = await setCachedAudio(cacheKey, wavBlob);
+          if (!cacheSuccess) {
+            console.warn('Failed to cache audio for:', cleanText.substring(0, 50));
+          }
+          
           return URL.createObjectURL(wavBlob);
 
         } catch (error) {
           console.error('Pocket TTS generation error:', error);
+          // Log more details for debugging mobile issues
+          console.error('Error details:', {
+            message: error.message,
+            stack: error.stack,
+            text: cleanText.substring(0, 50),
+            voice: useVoice
+          });
           return null;
         }
       }, [voice, loadPocketTTSModel]); // speed is now constant (NATURAL_SPEED)
@@ -1799,24 +1868,43 @@
         // If not in memory, try IndexedDB cache
         if (!url) {
           url = await loadFromCache(text);
-          if (url) cacheRef.current[idx] = url; // Store in memory for next time
+          if (url) {
+            cacheRef.current[idx] = url; // Store in memory for next time
+          } else {
+            console.error('Audio not found in cache for:', text.substring(0, 50));
+          }
         }
 
         // Play the cached audio (stories MUST be downloaded before playing)
         if (url && audioRef.current) {
           try {
+            console.log('Playing audio for:', text.substring(0, 30), 'URL:', url.substring(0, 50));
             audioRef.current.src = url;
+            
+            // Android-specific: Force load before play
+            if (deviceInfoRef.current?.isMobile) {
+              audioRef.current.load();
+            }
+            
             await audioRef.current.play();
             setIsPlaying(true);
+            console.log('Audio playback started successfully');
             return;
           } catch (e) {
-            console.warn('Audio playback failed:', e);
+            console.error('Audio playback failed:', e.name, e.message);
+            console.error('Audio element state:', {
+              readyState: audioRef.current.readyState,
+              networkState: audioRef.current.networkState,
+              error: audioRef.current.error?.message
+            });
           }
         }
 
         // No cached audio found - this shouldn't happen for downloaded stories
         // But just in case, play a ready cue and move on
-        console.warn('No cached audio found for:', text.substring(0, 30));
+        if (!url) {
+          console.error('No cached audio found for:', text.substring(0, 30), '- Story may not be downloaded');
+        }
         playCue('ready');
       }, [loadFromCache, playCue, storyTitle]);
 
@@ -2959,7 +3047,7 @@
                     }}
                     ref={(el) => { if (el && !showEditControls) el.focus(); }}
                   >
-                    <audio ref={carouselAudioRef} preload="auto" hidden />
+                    <audio ref={carouselAudioRef} preload="auto" playsinline hidden />
 
                     <div className="w-full flex items-center" style={{ height: 'calc(100% - 40px)' }}>
                       <div
@@ -3269,7 +3357,7 @@
           aria-live="polite"
         >
           {renderBoundary()}
-          <audio ref={audioRef} onEnded={handleAudioEnded} preload="auto" hidden />
+          <audio ref={audioRef} onEnded={handleAudioEnded} preload="auto" playsinline hidden />
 
           <div className="absolute top-5 left-5 z-[60]" onTouchStart={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()}>
             <button
