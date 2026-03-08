@@ -1,4 +1,4 @@
-const CACHE_NAME = 'storytap-v1.0.1';
+const CACHE_NAME = 'storytap-v1.0.2';
 const ASSETS_TO_CACHE = [
   './',
   './index.html',
@@ -70,8 +70,15 @@ self.addEventListener('fetch', (e) => {
           });
           return response;
         })
-        .catch(() => {
-          return caches.match('./index.html') || caches.match(e.request);
+        .catch(async () => {
+          const cachedIndex = await caches.match('./index.html');
+          if (cachedIndex) return cachedIndex;
+          const cachedReq = await caches.match(e.request);
+          if (cachedReq) return cachedReq;
+          return new Response('Offline', {
+            status: 503,
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+          });
         })
     );
     return;
@@ -115,10 +122,13 @@ self.addEventListener('fetch', (e) => {
             cache.put(e.request, networkResponse.clone());
           }
           return networkResponse;
-        }).catch(() => null);
+        }).catch(() => undefined);
 
         // Return cached if available, else wait for network
-        return cachedResponse || networkFetch;
+        if (cachedResponse) return cachedResponse;
+        const net = await networkFetch;
+        if (net) return net;
+        return new Response('', { status: 504, statusText: 'Gateway Timeout' });
       })
     );
     return;

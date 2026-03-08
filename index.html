@@ -3532,11 +3532,32 @@
 
   <script>
     if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('sw.js')
-          .then(registration => console.log('SW registered: ', registration.scope))
-          .catch(registrationError => console.log('SW registration failed: ', registrationError));
-      });
+      const ua = navigator.userAgent || '';
+      const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+      // iOS Safari can get stuck in a bad SW/cache state that repeatedly crashes page load.
+      // For stability, disable SW on iOS and clean up any previous registration.
+      if (isIOS) {
+        window.addEventListener('load', async () => {
+          try {
+            const regs = await navigator.serviceWorker.getRegistrations();
+            await Promise.all(regs.map(r => r.unregister()));
+            if (window.caches && caches.keys) {
+              const names = await caches.keys();
+              await Promise.all(names.map(name => caches.delete(name)));
+            }
+            console.log('iOS mode: service worker disabled and old caches cleared');
+          } catch (e) {
+            console.warn('iOS SW cleanup failed:', e);
+          }
+        });
+      } else {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('sw.js')
+            .then(registration => console.log('SW registered: ', registration.scope))
+            .catch(registrationError => console.log('SW registration failed: ', registrationError));
+        });
+      }
     }
   </script>
 </body>
