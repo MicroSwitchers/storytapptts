@@ -1295,14 +1295,24 @@
             setMode('library');
           }
 
-          // Mobile-aware pacing: yield between items to keep UI responsive
+          // iOS: WASM inference crashes Safari — skip generation entirely.
+          // The story is marked 'cached' immediately; playSentence uses speechSynthesis inline.
           const isMobile = device.isMobile;
           const isIOS = device.isIOS;
+          if (isIOS) {
+            setLibrary(prev => prev.map(s => s.id === story.id
+              ? { ...s, status: 'cached', progress: 100, progressText: null } : s));
+            processingRef.current = null;
+            playCue('download_done');
+            return;
+          }
+
+          // Mobile-aware pacing: yield between items to keep UI responsive
           // Single delay per item — enough to prevent ANR without freezing progress
-          const ITEM_DELAY = isIOS ? 400 : (isMobile ? 150 : 30);
-          // Extra pause every N items to let GC run (especially important on iOS)
-          const GC_INTERVAL = isIOS ? 3 : (isMobile ? 5 : 10);
-          const GC_PAUSE = isIOS ? 800 : (isMobile ? 300 : 100);
+          const ITEM_DELAY = isMobile ? 150 : 30;
+          // Extra pause every N items to let GC run
+          const GC_INTERVAL = isMobile ? 5 : 10;
+          const GC_PAUSE = isMobile ? 300 : 100;
 
           let completed = 0;
           let consecutiveErrors = 0;
@@ -1325,22 +1335,17 @@
             try {
               // Generate and cache audio (uses story's voice, speed locked to NATURAL_SPEED)
               const audioUrl = await generatePocketTTSAudio(allItemsToCache[i], story.voice, NATURAL_SPEED, true);
-              
-              // Verify the audio was actually cached and can be retrieved (Android fix)
+
               if (audioUrl) {
-                const cacheKey = getCacheKey(cleanTextForTTS(allItemsToCache[i]), story.voice, NATURAL_SPEED);
-                const cachedBlob = await getCachedAudio(cacheKey);
-                if (!cachedBlob) {
-                  console.error('Audio generated but not found in cache:', allItemsToCache[i].substring(0, 50));
-                  throw new Error('Cache verification failed');
-                }
-                // Release the URL to prevent memory leaks
+                // Release the one-time URL; audio is stored in IndexedDB
                 URL.revokeObjectURL(audioUrl);
+                consecutiveErrors = 0; // Reset on success
               } else {
-                throw new Error('Audio generation returned null');
+                // Generation returned null — skip item, keep going
+                console.warn('Audio generation failed for item:', allItemsToCache[i].substring(0, 40));
+                consecutiveErrors++;
+                await new Promise(r => setTimeout(r, 500));
               }
-              
-              consecutiveErrors = 0; // Reset on success
             } catch (e) {
               console.warn('Error caching item:', e);
               consecutiveErrors++;
@@ -1900,10 +1905,24 @@
           }
         }
 
-        // No cached audio found - this shouldn't happen for downloaded stories
-        // But just in case, play a ready cue and move on
+        // No cached audio — on iOS use speechSynthesis fallback (WASM is skipped on iOS)
+        if (!url && deviceInfoRef.current?.isIOS && window.speechSynthesis) {
+          const utterance = new SpeechSynthesisUtterance(text);
+          // Pick an English voice if available
+          const voices = window.speechSynthesis.getVoices();
+          const enVoice = voices.find(v => v.lang.startsWith('en-') && v.localService) ||
+                          voices.find(v => v.lang.startsWith('en')) || null;
+          if (enVoice) utterance.voice = enVoice;
+          utterance.rate = 0.9;
+          utterance.onend = () => { setIsPlaying(false); playCue('ready'); };
+          utterance.onerror = () => { setIsPlaying(false); playCue('ready'); };
+          window.speechSynthesis.speak(utterance);
+          setIsPlaying(true);
+          return;
+        }
+
         if (!url) {
-          console.error('No cached audio found for:', text.substring(0, 30), '- Story may not be downloaded');
+          console.warn('No cached audio found for:', text.substring(0, 30));
         }
         playCue('ready');
       }, [loadFromCache, playCue, storyTitle]);
