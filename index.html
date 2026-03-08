@@ -1619,7 +1619,8 @@
       const [showEditControls, setShowEditControls] = useState(false);
 
       // iOS: user-chosen narration voice (empty string = auto-pick best)
-      const [iosVoiceName, setIosVoiceName] = useState(prefs.iosVoiceName || '');
+      // Default: 'American Voice 3' — one of Apple's new high-quality Siri voices (iOS 16+)
+      const [iosVoiceName, setIosVoiceName] = useState(prefs.iosVoiceName !== undefined ? prefs.iosVoiceName : 'American Voice 3');
       const [availableIOSVoices, setAvailableIOSVoices] = useState([]);
       const [storyColor, setStoryColor] = useState('indigo');
 
@@ -1990,7 +1991,7 @@
           const local  = (v) => v.localService;
           const prem   = (v) => v.name.includes('Premium');
           const enh    = (v) => v.name.includes('Enhanced');
-          const named  = (v) => ['Samantha','Daniel','Karen','Moira','Zoe','Tom','Nicky','Ava'].some(n => v.name.includes(n));
+          const named  = (v) => ['American Voice 3','Voice 3','Samantha','Daniel','Karen','Moira','Zoe','Tom','Nicky','Ava'].some(n => v.name.includes(n));
 
           const enVoice =
             (iosVoiceName && voices.find(v => v.name === iosVoiceName)) ||
